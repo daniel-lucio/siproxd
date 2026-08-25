@@ -1,0 +1,264 @@
+diff --git a/src/siproxd.c b/src/siproxd.c
+index 8801fda..0000000 100644
+--- a/src/siproxd.c
++++ b/src/siproxd.c
+@@
+ #include <fcntl.h>
+ #include <signal.h>
++#include <stddef.h>
+ #include <netinet/in.h>
+ #include <arpa/inet.h>
+@@
+ static  int dmalloc_dump=0;
+ static  int exit_program=0;
++static volatile sig_atomic_t reload_config=0;
+@@
+ static void sighandler(int sig);
++static int reload_configuration(char *configfile, int config_search,
++                                int cmdline_debuglevel);
++
++static void retarget_cfgopts(cfgopts_t dst[], struct siproxd_config *target)
++{
++   int i;
++   ptrdiff_t off;
++
++   for (i=0; main_cfg_opts[i].keyword != NULL; i++) {
++      dst[i] = main_cfg_opts[i];
++      off = (char *)main_cfg_opts[i].dest - (char *)&configuration;
++      dst[i].dest = (void *)((char *)target + off);
++   }
++   dst[i] = main_cfg_opts[i];
++}
++
++static void free_stringa(stringa_t *a)
++{
++   int i;
++   for (i=0; i<a->used && i<CFG_STRARR_SIZE; i++) {
++      free(a->string[i]);
++      a->string[i]=NULL;
++   }
++   a->used=0;
++}
++
++static void free_cfg_strings(struct siproxd_config *cfg)
++{
++   cfgopts_t opts[sizeof(main_cfg_opts)/sizeof(main_cfg_opts[0])];
++   int i;
++
++   retarget_cfgopts(opts, cfg);
++   for (i=0; opts[i].keyword != NULL; i++) {
++      if (opts[i].type == TYP_STRING) {
++         char **p=(char **)opts[i].dest;
++         free(*p);
++         *p=NULL;
++      } else if (opts[i].type == TYP_STRINGA) {
++         free_stringa((stringa_t *)opts[i].dest);
++      }
++   }
++}
++
++static int str_changed(const char *a, const char *b)
++{
++   if (a == NULL && b == NULL) return 0;
++   if (a == NULL || b == NULL) return 1;
++   return strcmp(a,b) != 0;
++}
++
++static int stringa_changed(const stringa_t *a, const stringa_t *b)
++{
++   int i;
++   if (a->used != b->used) return 1;
++   for (i=0; i<a->used; i++) {
++      if (str_changed(a->string[i], b->string[i])) return 1;
++   }
++   return 0;
++}
++
++static void keep_restart_string(const char *name, char **newp, char **oldp)
++{
++   if (str_changed(*newp, *oldp)) {
++      WARN("configuration option '%s' changed; restart required, keeping current value", name);
++   }
++   free(*newp);
++   *newp=*oldp;
++   *oldp=NULL;
++}
++
++static void keep_restart_stringa(const char *name, stringa_t *newa,
++                                 stringa_t *olda)
++{
++   if (stringa_changed(newa, olda)) {
++      WARN("configuration option '%s' changed; restart required, keeping current value", name);
++   }
++   free_stringa(newa);
++   *newa=*olda;
++   memset(olda,0,sizeof(*olda));
++}
++
++#define KEEP_RESTART_INT(field, name) do { \
++   if (newcfg.field != oldcfg.field) \
++      WARN("configuration option '%s' changed; restart required, keeping current value", name); \
++   newcfg.field = oldcfg.field; \
++} while (0)
++
++static int reload_configuration(char *configfile, int config_search,
++                                int cmdline_debuglevel)
++{
++   struct siproxd_config newcfg;
++   struct siproxd_config oldcfg;
++   cfgopts_t opts[sizeof(main_cfg_opts)/sizeof(main_cfg_opts[0])];
++
++   memset(&newcfg,0,sizeof(newcfg));
++   retarget_cfgopts(opts,&newcfg);
++
++   INFO("SIGHUP received - reloading configuration");
++   if (read_config(configfile, config_search, opts, "") == STS_FAILURE) {
++      ERROR("SIGHUP configuration reload rejected; continuing with previous configuration");
++      free_cfg_strings(&newcfg);
++      return STS_FAILURE;
++   }
++
++   if (newcfg.rtp_port_low & 0x01) {
++      newcfg.rtp_port_low=(newcfg.rtp_port_low+1) & ~0x01;
++      WARN("rtp_port_low should be an even number; rounded up to %i",
++           newcfg.rtp_port_low);
++   }
++   if (newcfg.rtp_port_high & 0x01) {
++      newcfg.rtp_port_high &= ~0x01;
++   }
++   if ((newcfg.rtp_port_low < 0) || (newcfg.rtp_port_low > 65535) ||
++       (newcfg.rtp_port_high < 0) || (newcfg.rtp_port_high > 65535) ||
++       (newcfg.rtp_port_low && newcfg.rtp_port_high &&
++        newcfg.rtp_port_low > newcfg.rtp_port_high)) {
++      ERROR("SIGHUP configuration reload rejected: invalid RTP port range");
++      free_cfg_strings(&newcfg);
++      return STS_FAILURE;
++   }
++
++   if (cmdline_debuglevel != 0) newcfg.debuglevel=cmdline_debuglevel;
++
++   oldcfg=configuration;
++
++   /* Settings tied to process/socket/thread lifetime are intentionally
++    * not changed in Stage 1. */
++   KEEP_RESTART_INT(debugport, "debug_port");
++   KEEP_RESTART_INT(sip_listen_port, "sip_listen_port");
++   KEEP_RESTART_INT(daemonize, "daemonize");
++   KEEP_RESTART_INT(rtp_timeout, "rtp_timeout");
++   KEEP_RESTART_INT(rtp_proxy_enable, "rtp_proxy_enable");
++   KEEP_RESTART_INT(rtp_input_dejitter, "rtp_input_dejitter");
++   KEEP_RESTART_INT(rtp_output_dejitter, "rtp_output_dejitter");
++   KEEP_RESTART_INT(sip_dscp, "sip_dscp");
++   KEEP_RESTART_INT(thread_stack_size, "thread_stack_size");
++
++   keep_restart_string("user", &newcfg.user, &oldcfg.user);
++   keep_restart_string("chrootjail", &newcfg.chrootjail, &oldcfg.chrootjail);
++   keep_restart_string("proxy_auth_pwfile", &newcfg.proxy_auth_pwfile,
++                       &oldcfg.proxy_auth_pwfile);
++   keep_restart_string("pid_file", &newcfg.pid_file, &oldcfg.pid_file);
++   keep_restart_string("plugindir", &newcfg.plugin_dir, &oldcfg.plugin_dir);
++   keep_restart_stringa("load_plugin", &newcfg.load_plugin,
++                        &oldcfg.load_plugin);
++
++   /* configfile/config_search are runtime metadata, not parser options. */
++   newcfg.configfile=oldcfg.configfile;
++   newcfg.config_search=oldcfg.config_search;
++   oldcfg.configfile=NULL;
++
++   configuration=newcfg;
++   free_cfg_strings(&oldcfg);
++
++   log_set_pattern(configuration.debuglevel);
++   log_set_silence(configuration.silence_log);
++
++   INFO("configuration reload completed");
++   return STS_SUCCESS;
++}
+@@
+    if (sigaction(SIGPIPE, &act, NULL)) {
+       ERROR("Failed to install SIGPIPE handler");
+    }
++   /* Do not use SA_RESTART for SIGHUP.  We want select() to return EINTR
++    * so the main loop can process the reload immediately. */
++   act.sa_flags=0;
+    if (sigaction(SIGHUP, &act, NULL)) {
+       ERROR("Failed to install SIGHUP handler");
+    }
+@@
+          /* allow exit, even if there is no activity... */
+          if (exit_program) goto exit_prg;
++
++         if (reload_config) {
++            reload_config=0;
++            reload_configuration(configfile, config_search,
++                                 cmdline_debuglevel);
++         }
+ 
+          if (sts < 0) {
+@@
+ static void sighandler(int sig) {
+    if (sig==SIGTERM) exit_program=1;
+    if (sig==SIGINT)  exit_program=1;
+    if (sig==SIGUSR2) dmalloc_dump=1;
++   if (sig==SIGHUP)  reload_config=1;
+    return;
+ }
+diff --git a/src/readconf.c b/src/readconf.c
+index 07e7202..0000000 100644
+--- a/src/readconf.c
++++ b/src/readconf.c
+@@
+    char *tmpptr=NULL;
+    char *eqsign=NULL;
++   int parse_error=0;
+@@
+       if (eqsign == NULL) {
+          ERROR("Syntax error in config file [%s]", buff);
++         parse_error=1;
+          continue;
+       }
+@@
+ 	       ERROR("argument missing to config parameter %s",
+ 	             configoptions[k].keyword);
++	       parse_error=1;
+ 	       break;
+@@
+-		 if (used<=CFG_STRARR_SIZE){
++		 if (used<CFG_STRARR_SIZE){
+@@
+ 		    ERROR("no more space left in config string array %s",
+                           configoptions[k].keyword);
++		    parse_error=1;
+                  }
+@@
+ 	       ERROR("illegal format in config file, line:\"%s\"",buff);
++	       parse_error=1;
+ 	    }
+@@
+ 	  ERROR("unknown keyword in config file, line:\"%s\"",buff);
++	  parse_error=1;
+        }
+    } // while
+-   return STS_SUCCESS;
++   return parse_error ? STS_FAILURE : STS_SUCCESS;
+@@
+          case TYP_STRINGA:
+-            memset(cfgopts2[k].dest, 0, sizeof (char *));
++            memset(cfgopts2[k].dest, 0, sizeof (stringa_t));
+             break;
+diff --git a/src/sock.c b/src/sock.c
+index c9b8524..0000000 100644
+--- a/src/sock.c
++++ b/src/sock.c
+@@
+       } else {
+          /* could not get root */
+          WARN("siproxd not started as root - cannot set DSCP value");
+-         configuration.rtp_dscp = 0; /* inhibit further attempts */
++         configuration.sip_dscp = 0; /* inhibit further attempts */
+       }
+@@
+-      if ((sip_tcp_cache[i].keepalive_ts + configuration.tcp_keepalive) <= now) {
++      if ((configuration.tcp_keepalive > 0) &&
++          ((sip_tcp_cache[i].keepalive_ts + configuration.tcp_keepalive) <= now)) {
+          DEBUGC(DBCLASS_NET, "sending TCP keepalive [%s:%i] fd=%i idx=%i",
