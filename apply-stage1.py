@@ -2,8 +2,13 @@
 """Apply stage1-sighup.patch despite its original bare @@ hunk headers.
 
 The original Stage 1 patch contains valid diff bodies but malformed hunk
-headers.  This helper applies each hunk by exact context matching and refuses
-to continue if a hunk is ambiguous or no longer matches the source tree.
+headers. This helper applies each hunk by exact context matching and refuses
+to write any files if a hunk is ambiguous or no longer matches the source.
+
+Hunks are applied bottom-to-top within each file. This is important because
+some adjacent hunks in the original patch have overlapping context; applying
+them top-to-bottom would make a later hunk fail against text changed by an
+earlier hunk.
 
 Run from the repository root on branch feature/sighup-reload:
     python3 apply-stage1.py
@@ -49,20 +54,66 @@ def parse_patch(text: str):
     return files
 
 
-def apply_hunk(source: str, lines, path: str, number: int) -> str:
+def hunk_old_new(lines):
     old = "".join(line[1:] for line in lines if line.startswith((" ", "-")))
     new = "".join(line[1:] for line in lines if line.startswith((" ", "+")))
+    return old, new
+
+
+def locate_hunk(source: str, lines, path: str, number: int):
+    old, new = hunk_old_new(lines)
 
     if not old:
         die(f"{path}: hunk {number} has no context/deletion lines")
 
-    count = source.count(old)
-    if count == 0:
-        die(f"{path}: hunk {number} does not match the current source")
-    if count > 1:
-        die(f"{path}: hunk {number} is ambiguous ({count} exact matches)")
+    positions = []
+    start = 0
+    while True:
+        pos = source.find(old, start)
+        if pos < 0:
+            break
+        positions.append(pos)
+        start = pos + 1
 
-    return source.replace(old, new, 1)
+    if not positions:
+        # A previous run may already have applied this hunk. Treat that as
+        # success only if the complete replacement text occurs exactly once.
+        new_count = source.count(new)
+        if new_count == 1:
+            return None, old, new
+        die(f"{path}: hunk {number} does not match the current source")
+
+    if len(positions) > 1:
+        die(f"{path}: hunk {number} is ambiguous ({len(positions)} exact matches)")
+
+    return positions[0], old, new
+
+
+def apply_file(source: str, hunks, path: str) -> str:
+    # Locate all hunks against the pristine source first. This guarantees that
+    # overlapping context in one hunk cannot invalidate another hunk merely
+    # because of application order.
+    located = []
+    for number, lines in enumerate(hunks, 1):
+        pos, old, new = locate_hunk(source, lines, path, number)
+        if pos is not None:
+            located.append((pos, number, old, new))
+
+    # Apply from the bottom of the file upward so byte offsets above an edit
+    # remain valid. Refuse true edit-range overlap; context overlap is fine.
+    located.sort(key=lambda item: item[0], reverse=True)
+    last_start = len(source) + 1
+    for pos, number, old, new in located:
+        edit_end = pos + len(old)
+        if edit_end > last_start:
+            # The malformed source patch can contain overlapping context, but
+            # two actual replacement ranges should not overlap. If they do,
+            # stop rather than guess.
+            die(f"{path}: hunk {number} replacement overlaps another hunk")
+        source = source[:pos] + new + source[edit_end:]
+        last_start = pos
+
+    return source
 
 
 def main() -> None:
@@ -84,9 +135,7 @@ def main() -> None:
             die(f"target file {path} does not exist")
 
         source = p.read_text(encoding="utf-8")
-        for n, hunk in enumerate(entry["hunks"], 1):
-            source = apply_hunk(source, hunk, path, n)
-        pending[p] = source
+        pending[p] = apply_file(source, entry["hunks"], path)
 
     # Only write after every hunk in every file has been validated/applied in memory.
     for p, source in pending.items():
